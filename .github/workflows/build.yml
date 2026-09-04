@@ -1,0 +1,198 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ==========================================================
+      # 1. 检出代码
+      # ==========================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 2. JDK 17
+      #    Android Gradle Plugin 8.x 要求 JDK 17
+      # ==========================================================
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ==========================================================
+      # 3. Gradle（含依赖缓存，加速后续构建）
+      # ==========================================================
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # ==========================================================
+      # 4. 工程自查
+      #
+      #    这是本项目最重要的改进。
+      #    之前多轮 CI 失败都源于"检查器没拦住的编译错误"，
+      #    每次要等 CI 跑完才知道。现在 push 前先本地过一遍，
+      #    编译错误在这里就能拦截，反馈快得多。
+      # ==========================================================
+      - name: Run project checks
+        run: python3 scripts/check.py
+
+      # ==========================================================
+      # 5. 检查器自身的反向测试
+      #
+      #    验证检查器没有"误放行"——
+      #    注入已知错误必须报警，否则说明规则失效。
+      # ==========================================================
+      - name: Verify checker catches injected errors
+        run: python3 scripts/test_checker.py
+
+      # ==========================================================
+      # 5b. 未定义符号检查
+      #
+      #     "写了调用但忘了写定义" —— 括号与 import 检查都看不出来，
+      #     真编译才会暴露。本项目真实发生过：
+      #     用脚本做「全限定名 → 简名」清理时连 import 行一起改，
+      #     把 6 个 import 路径截断成 'import AnimatedVisibility'。
+      # ==========================================================
+      - name: Check for undefined symbols
+        run: python3 scripts/check_symbols.py
+
+      # ==========================================================
+      # 5c. 穷举式调用点核查
+      #
+      #     check_symbols.py 只校验硬编码的少数对象，
+      #     自定义对象上的方法调用写错它完全无感。
+      #     这里反过来穷举每一个 `标识符(` 调用点逐个归类。
+      # ==========================================================
+      - name: Exhaustive call-site check
+        run: python3 scripts/check_calls.py
+
+      # ==========================================================
+      # 5d. 命名参数匹配核查
+      #
+      #     本项目真实踩过两次：
+      #       1. ResultCard 调用处 `model` vs 定义处 `yPulseMode`
+      #       2. Field 的 `on` 位置在前，导致 Modifier 被绑给 on
+      #     括号与 import 检查都发现不了，只能逐参数比对。
+      # ==========================================================
+      - name: Named parameter check
+        run: python3 scripts/check_params.py
+
+      # ==========================================================
+      # 5e. 颜色对比度（WCAG AA）
+      #
+      #     用户反馈"浅色模式看不到字"。根因是硬编码颜色：
+      #     深底上醒目的亮青绿放到浅底上只有 2.3:1。
+      #     这类问题肉眼看代码发现不了，只能算。
+      # ==========================================================
+      - name: Color contrast check
+        run: python3 scripts/check_contrast.py
+
+      # ==========================================================
+      # 5f. 变量「先声明后使用」
+      #
+      #     Kotlin 局部变量必须先声明后使用（类成员不受此限）。
+      #     本项目真实踩过：CalcScreen 里 LaunchedEffect 用了
+      #     在 80 行之后才声明的 importDraft / importHint，
+      #     CI 报 Unresolved reference。
+      #     括号、import、参数名检查全都发现不了。
+      # ==========================================================
+      - name: Variable declaration order check
+        run: python3 scripts/check_order.py
+
+      # ==========================================================
+      # 6. 算法一致性验证
+      #    确保改写没有偏离原作者算法
+      # ==========================================================
+      - name: Verify algorithm vs original
+        run: |
+          python3 scripts/verify_core.py
+          python3 scripts/verify_full.py
+
+      # ==========================================================
+      # 7. 构建 debug APK
+      # ==========================================================
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      # ==========================================================
+      # 8. 校验 APK 完整性
+      #
+      #    曾出现过 "invalid distance code" —— APK 是 ZIP，
+      #    压缩数据损坏会导致无法安装。这里在 CI 侧先验证，
+      #    若产物本身损坏就让构建失败，便于区分是
+      #    "构建问题"还是"下载问题"。
+      # ==========================================================
+      - name: Verify APK integrity
+        run: |
+          APK=$(ls -1 app/build/outputs/apk/debug/*.apk | head -1)
+          echo "APK: $APK"
+          ls -lh "$APK"
+          unzip -t "$APK"
+          echo "SHA256: $(sha256sum "$APK" | cut -d' ' -f1)"
+
+      # ==========================================================
+      # 9. 输出 APK 元数据
+      #
+      #    用 aapt2 读出包名、版本、图标路径 ——
+      #    用于核对"图标是否正确打进 APK"。
+      #    之前出现过图标显示为默认机器人的问题，
+      #    有了这一步能直接看到 APK 里到底有没有图标资源。
+      # ==========================================================
+      - name: Dump APK metadata
+        run: |
+          APK=$(ls -1 app/build/outputs/apk/debug/*.apk | head -1)
+          AAPT=$(find "$ANDROID_HOME" -name aapt2 -type f 2>/dev/null | head -1)
+          if [ -n "$AAPT" ]; then
+            echo "----- badging -----"
+            "$AAPT" dump badging "$APK" 2>&1 | head -20
+          else
+            echo "aapt2 not found, skipping metadata dump"
+          fi
+
+      # ==========================================================
+      # 10. 上传产物
+      #
+      #     ① zip 压缩版（GitHub 默认会对 artifact 二次压缩）
+      #     ② 不压缩版 —— 避免二次压缩干扰，便于排查"下载损坏"
+      # ==========================================================
+      - name: Upload APK (zipped)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pearl-cannon-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Upload APK (uncompressed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pearl-cannon-debug-apk-raw
+          path: app/build/outputs/apk/debug/*.apk
+          compression-level: 0
+
+      # ==========================================================
+      # 11. Release 时构建签名 APK
+      #     签名信息全部来自 Secrets，不写入源码
+      # ==========================================================
+      - name: Build release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: gradle --no-daemon :app:assembleRelease
+        env:
+          RELEASE_STORE_FILE: ${{ secrets.RELEASE_STORE_FILE }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+      - name: Upload release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: pearl-cannon-release-apk
+          path: app/build/outputs/apk/release/*.apk

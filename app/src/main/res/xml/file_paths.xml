@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 路径白名单 —— 允许分享 App 内部存储里的崩溃日志。
+  只暴露 filesDir，遵循最小权限原则。
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="crash_logs" path="." />
+</paths>

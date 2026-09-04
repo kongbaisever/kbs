@@ -1,0 +1,37 @@
+# 构建产物
+/build/
+/app/build/
+/app/release/
+*.apk
+*.aab
+
+# Gradle
+.gradle/
+/local.properties
+gradle-app.setting
+!gradle-wrapper.jar
+.gradletasknamecache
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份文件（检查器反向测试用）
+*.bak
+
+# 签名（绝不入库）
+*.jks
+*.keystore
+keystore.properties
